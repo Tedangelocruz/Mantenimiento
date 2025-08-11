@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Streamlit cache
+.streamlit/
+
+# Ignore all files in data except .gitkeep
+data/*
+!data/.gitkeep
