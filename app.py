@@ -522,7 +522,7 @@ def detail_view(ficha: str):
                         img_path = os.path.join(ficha_dir(ficha), fn)
                         if os.path.exists(img_path):
                             with cols[i % 3]:
-                                st.image(img_path, use_column_width=True, caption=fn)
+                                st.image(img_path, use_container_width=True, caption=fn)
                         else:
                             with cols[i % 3]:
                                 st.warning(f"Archivo faltante: {fn}")
@@ -536,7 +536,7 @@ def detail_view(ficha: str):
             for i, fn in enumerate(orphans):
                 img_path = os.path.join(ficha_dir(ficha), fn)
                 with cols[i % 3]:
-                    st.image(img_path, use_column_width=True, caption=fn)
+                    st.image(img_path, use_container_width=True, caption=fn)
 
 # ---------------------------
 # Main (single-tab routing)
