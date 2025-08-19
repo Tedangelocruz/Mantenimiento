@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # ---------------------------
-# Google Drive (NEW)
+# Google Drive
 # ---------------------------
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -31,13 +31,26 @@ EXCLUDE_FICHAS = {"HONDO VALLE", "VILLA RIVA", "SAJOMA", "PINA", "AIC", "ENRIQUI
 EXCLUDE_FICHAS_UPPER = {s.upper() for s in EXCLUDE_FICHAS}
 
 # ---------------------------
-# Google Drive settings (NEW)
+# Google Drive settings
 # ---------------------------
 def _gcreds():
-    info = json.loads(st.secrets["GSERVICE_ACCOUNT_JSON"])
-    scopes = [
-        "https://www.googleapis.com/auth/drive",
-    ]
+    # Support EITHER a TOML table ([gcp_service_account]) OR a JSON string (GSERVICE_ACCOUNT_JSON)
+    info = None
+    if "gcp_service_account" in st.secrets:
+        # Works if you stored the JSON as a table
+        info = dict(st.secrets["gcp_service_account"])
+    else:
+        raw = st.secrets.get("GSERVICE_ACCOUNT_JSON", "")
+        if not raw:
+            st.error('Missing credentials: add either [gcp_service_account] or GSERVICE_ACCOUNT_JSON in Secrets.')
+            st.stop()
+        try:
+            info = json.loads(raw)
+        except Exception:
+            st.error("GSERVICE_ACCOUNT_JSON is not valid JSON (check quotes and \\n in private_key).")
+            st.stop()
+
+    scopes = ["https://www.googleapis.com/auth/drive"]
     return Credentials.from_service_account_info(info, scopes=scopes)
 
 def _drive():
@@ -65,19 +78,23 @@ def make_public(file_id: str):
     except Exception:
         pass
 
-def upload_bytes(parent_id: str, filename: str, data: bytes, mimetype: str | None = None) -> str:
-    """Upload raw bytes to Drive and return webViewLink."""
+def _direct_image_url(file_id: str) -> str:
+    """Return a direct display URL usable by st.image()."""
+    return f"https://drive.google.com/uc?id={file_id}"
+
+def upload_bytes(parent_id: str, filename: str, data: bytes, mimetype: str = None) -> str:
+    """Upload raw bytes to Drive and return a DIRECT image URL (so Streamlit can render it)."""
     drv = _drive()
     media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=False)
     meta = {"name": filename, "parents": [parent_id]}
-    file = drv.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
-    make_public(file["id"])
-    info = drv.files().get(fileId=file["id"], fields="webViewLink").execute()
-    return info.get("webViewLink")
+    file = drv.files().create(body=meta, media_body=media, fields="id").execute()
+    file_id = file["id"]
+    make_public(file_id)
+    return _direct_image_url(file_id)
 
-def upsert_file(parent_id: str, filename: str, data: bytes, mimetype: str | None = None) -> str:
+def upsert_file(parent_id: str, filename: str, data: bytes, mimetype: str = None) -> str:
     """
-    Create or update a file by name under parent_id; return webViewLink.
+    Create or update a file by name under parent_id; return a direct-view link.
     If a file with the same name exists, it is updated in place (so the link stays stable).
     """
     drv = _drive()
@@ -86,10 +103,9 @@ def upsert_file(parent_id: str, filename: str, data: bytes, mimetype: str | None
     media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=False)
     if res.get("files"):
         fid = res["files"][0]["id"]
-        drv.files().update(fileId=fid, media_body=media, fields="id,webViewLink").execute()
+        drv.files().update(fileId=fid, media_body=media, fields="id").execute()
         make_public(fid)
-        info = drv.files().get(fileId=fid, fields="webViewLink").execute()
-        return info.get("webViewLink")
+        return _direct_image_url(fid)
     else:
         return upload_bytes(parent_id, filename, data, mimetype)
 
@@ -444,7 +460,7 @@ def detail_view(ficha: str):
         img_names = []
         drive_links = []  # NEW
 
-        # NEW: create (or find) per-ficha folder in Google Drive
+        # Create (or find) per-ficha folder in Google Drive
         ficha_folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
 
         for up in up_files or []:
@@ -456,9 +472,9 @@ def detail_view(ficha: str):
                 f.write(up.getbuffer())
             img_names.append(fname)
 
-            # Upload to Drive (NEW)
+            # Upload to Drive (NEW) and store direct URL
             try:
-                drive_link = upload_bytes(ficha_folder_id, fname, up.getbuffer(), mimetype=up.type)
+                drive_link = upload_bytes(ficha_folder_id, fname, up.getbuffer(), mimetype=getattr(up, "type", None))
                 drive_links.append(drive_link)
             except Exception as e:
                 st.warning(f"No se pudo subir {fname} a Drive: {e}")
@@ -469,9 +485,8 @@ def detail_view(ficha: str):
             "maintenance_type": tipo,
             "notas": notas,
             "parts_consumed": piezas,
-            "images": img_names,
-            # store Drive links alongside local names (schema extension)
-            "drive_links": drive_links,
+            "images": img_names,        # local filenames
+            "drive_links": drive_links, # NEW: Drive URLs for post-reboot display
             "created_at": datetime.now().isoformat(timespec="seconds")
         }
         meta.setdefault("records", [])
@@ -480,7 +495,7 @@ def detail_view(ficha: str):
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_metadata(ficha, meta)
 
-        # ---- Update Excel and push a copy to Drive (NEW) ----
+        # ---- Update Excel and push a copy to Drive ----
         ok = update_excel_date(ficha, fecha_rec)
         if ok:
             try:
@@ -514,18 +529,26 @@ def detail_view(ficha: str):
                 with top_cols[3]:
                     st.markdown(f"**ID:** `{rec.get('id','')}`")
 
-                # Thumbnails grid (still local display; Drive links are stored)
+                # Thumbnails grid: try local first, fall back to Drive URLs
                 imgs = rec.get("images", [])
-                if imgs:
-                    cols = st.columns(3)
-                    for i, fn in enumerate(imgs):
-                        img_path = os.path.join(ficha_dir(ficha), fn)
-                        if os.path.exists(img_path):
-                            with cols[i % 3]:
-                                st.image(img_path, use_container_width=True, caption=fn)
-                        else:
-                            with cols[i % 3]:
-                                st.warning(f"Archivo faltante: {fn}")
+                links = rec.get("drive_links", [])
+                cols = st.columns(3)
+                # pair images and links safely
+                max_items = max(len(imgs), len(links))
+                for i in range(max_items):
+                    local_name = imgs[i] if i < len(imgs) else None
+                    drive_url = links[i] if i < len(links) else None
+                    with cols[i % 3]:
+                        shown = False
+                        if local_name:
+                            img_path = os.path.join(ficha_dir(ficha), local_name)
+                            if os.path.exists(img_path):
+                                st.image(img_path, use_container_width=True, caption=local_name)
+                                shown = True
+                        if not shown and drive_url:
+                            st.image(drive_url, use_container_width=True, caption=os.path.basename(drive_url))
+                        if not shown and local_name:
+                            st.warning(f"Archivo faltante: {local_name}")
 
     # Optional: show orphan images not linked to any record
     orphans = list_images_unassigned(ficha)
@@ -536,7 +559,7 @@ def detail_view(ficha: str):
             for i, fn in enumerate(orphans):
                 img_path = os.path.join(ficha_dir(ficha), fn)
                 with cols[i % 3]:
-                    st.image(img_path, use_container_width=True, caption=fn)
+                    st.image(img_path, use_column_width=True, caption=fn)
 
 # ---------------------------
 # Main (single-tab routing)
@@ -551,4 +574,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
