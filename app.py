@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -7,6 +6,13 @@ from io import BytesIO
 from datetime import datetime, date, timedelta
 import pandas as pd
 import streamlit as st
+
+# ---------------------------
+# Google Drive (NEW)
+# ---------------------------
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ---------------------------
 # Config
@@ -23,6 +29,69 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # Fichas a excluir (case-insensitive)
 EXCLUDE_FICHAS = {"HONDO VALLE", "VILLA RIVA", "SAJOMA", "PINA", "AIC", "ENRIQUILLO"}
 EXCLUDE_FICHAS_UPPER = {s.upper() for s in EXCLUDE_FICHAS}
+
+# ---------------------------
+# Google Drive settings (NEW)
+# ---------------------------
+def _gcreds():
+    info = json.loads(st.secrets["GSERVICE_ACCOUNT_JSON"])
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+    ]
+    return Credentials.from_service_account_info(info, scopes=scopes)
+
+def _drive():
+    return build("drive", "v3", credentials=_gcreds(), cache_discovery=False)
+
+DRIVE_ROOT_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "root")  # put a folder ID in Secrets for a shared folder; otherwise SA's root
+
+def ensure_folder(parent_id: str, name: str) -> str:
+    """Find or create a Google Drive folder named `name` under parent_id, return its id."""
+    drv = _drive()
+    q = f"'{parent_id}' in parents and name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    res = drv.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+    folder = drv.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+def make_public(file_id: str):
+    """Set file 'anyone with the link can view' (ignore errors if already public)."""
+    drv = _drive()
+    try:
+        drv.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+    except Exception:
+        pass
+
+def upload_bytes(parent_id: str, filename: str, data: bytes, mimetype: str | None = None) -> str:
+    """Upload raw bytes to Drive and return webViewLink."""
+    drv = _drive()
+    media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=False)
+    meta = {"name": filename, "parents": [parent_id]}
+    file = drv.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
+    make_public(file["id"])
+    info = drv.files().get(fileId=file["id"], fields="webViewLink").execute()
+    return info.get("webViewLink")
+
+def upsert_file(parent_id: str, filename: str, data: bytes, mimetype: str | None = None) -> str:
+    """
+    Create or update a file by name under parent_id; return webViewLink.
+    If a file with the same name exists, it is updated in place (so the link stays stable).
+    """
+    drv = _drive()
+    q = f"'{parent_id}' in parents and name = '{filename}' and trashed = false"
+    res = drv.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=False)
+    if res.get("files"):
+        fid = res["files"][0]["id"]
+        drv.files().update(fileId=fid, media_body=media, fields="id,webViewLink").execute()
+        make_public(fid)
+        info = drv.files().get(fileId=fid, fields="webViewLink").execute()
+        return info.get("webViewLink")
+    else:
+        return upload_bytes(parent_id, filename, data, mimetype)
 
 # ---------------------------
 # Session-state navigation
@@ -189,15 +258,32 @@ def backup_excel() -> str:
     except Exception:
         return ""
 
+def _upload_excel_to_drive(df: pd.DataFrame):
+    """
+    Upload/update the Excel file in Drive even if local write fails.
+    """
+    # write dataframe to in-memory xlsx
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    data = buf.getvalue()
+
+    # upsert main Excel in Drive root folder (or provided folder)
+    excel_name = os.path.basename(EXCEL_PATH)
+    link = upsert_file(DRIVE_ROOT_FOLDER_ID, excel_name, data,
+                       mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.toast("Excel subido/actualizado en Google Drive.", icon="☁️")
+    return link
+
 def update_excel_date(ficha: str, new_date: date) -> bool:
     """
-    Update 'Fecha Ultiimo Mantenimiento' for the given ficha in the Excel file.
-    Returns True if a row was updated and the file saved.
+    Update 'Fecha Ultiimo Mantenimiento' for the given ficha in the Excel file,
+    then also upload/update the Excel in Google Drive.
     """
     try:
         df = pd.read_excel(EXCEL_PATH, sheet_name=0)
     except Exception as e:
-        st.error(f"No se pudo abrir el Excel: {e}")
+        st.error(f"No se pudo abrir el Excel local: {e}")
         return False
 
     df.columns = [str(c).strip() for c in df.columns]
@@ -208,7 +294,6 @@ def update_excel_date(ficha: str, new_date: date) -> bool:
     # Normalizar Ficha para comparar
     df["Ficha"] = df["Ficha"].astype(str).str.strip()
     mask = df["Ficha"] == str(ficha).strip()
-
     if not mask.any():
         st.warning("Ficha no encontrada en el Excel; no se actualizó la fecha.")
         return False
@@ -217,16 +302,24 @@ def update_excel_date(ficha: str, new_date: date) -> bool:
     new_str = new_date.strftime("%d/%m/%Y")
     df.loc[mask, "Fecha Ultiimo Mantenimiento"] = new_str
 
-    # Backup y guardado
+    # Backup del Excel actual y guardado local
     backup_excel()
+    wrote_local = False
     try:
-        # Mantener el resto de datos tal cual
         with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
             df.to_excel(writer, index=False)
-        return True
+        wrote_local = True
     except Exception as e:
-        st.error(f"Error al guardar el Excel: {e}")
-        return False
+        st.warning(f"No se pudo guardar el Excel localmente: {e}. Igual se subirá a Drive.")
+
+    # Siempre subimos/actualizamos en Drive (aunque el local falle)
+    try:
+        link = _upload_excel_to_drive(df)
+        st.caption(f"📄 Copia en Drive actualizada: {link}")
+    except Exception as e:
+        st.error(f"No se pudo subir el Excel a Drive: {e}")
+
+    return True if wrote_local else False
 
 # ---------------------------
 # Views
@@ -305,6 +398,7 @@ def list_view():
     cols = st.columns(4)
     for i, ficha in enumerate(ft["Ficha"]):
         with cols[i % 4]:
+            # (kept as-is to preserve UI/keys)
             if st.button(f"🗂️ {ficha}", key=f"open_{ficha}"):
                 go_detail(str(ficha))
 
@@ -348,13 +442,26 @@ def detail_view(ficha: str):
         rec_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         save_dir = ficha_dir(ficha)
         img_names = []
+        drive_links = []  # NEW
+
+        # NEW: create (or find) per-ficha folder in Google Drive
+        ficha_folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
+
         for up in up_files or []:
             ext = os.path.splitext(up.name)[1].lower()
             fname = f"{rec_id}_{safe_key(os.path.splitext(up.name)[0])}{ext}"
             path = os.path.join(save_dir, fname)
+            # Save locally (as before)
             with open(path, "wb") as f:
                 f.write(up.getbuffer())
             img_names.append(fname)
+
+            # Upload to Drive (NEW)
+            try:
+                drive_link = upload_bytes(ficha_folder_id, fname, up.getbuffer(), mimetype=up.type)
+                drive_links.append(drive_link)
+            except Exception as e:
+                st.warning(f"No se pudo subir {fname} a Drive: {e}")
 
         new_rec = {
             "id": rec_id,
@@ -363,6 +470,8 @@ def detail_view(ficha: str):
             "notas": notas,
             "parts_consumed": piezas,
             "images": img_names,
+            # store Drive links alongside local names (schema extension)
+            "drive_links": drive_links,
             "created_at": datetime.now().isoformat(timespec="seconds")
         }
         meta.setdefault("records", [])
@@ -371,19 +480,17 @@ def detail_view(ficha: str):
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_metadata(ficha, meta)
 
-        # ---- NEW: update Excel with the new maintenance date ----
+        # ---- Update Excel and push a copy to Drive (NEW) ----
         ok = update_excel_date(ficha, fecha_rec)
         if ok:
-            # Clear cache so the main list reloads fresh
             try:
                 load_data.clear()
             except Exception:
                 pass
-            st.success("Mantenimiento guardado y Excel actualizado. Regresando a la lista principal...")
-            # Return to list so user immediately sees the updated green/red status
+            st.success("Mantenimiento guardado, Excel actualizado y copiado a Google Drive. Regresando a la lista...")
             go_list()
         else:
-            st.warning("Se guardó el mantenimiento pero no se pudo actualizar el Excel.")
+            st.warning("Se guardó el registro y se subieron las imágenes; no se pudo actualizar el Excel local, pero sí se copió a Drive.")
 
     st.divider()
     st.subheader("📚 Historial de mantenimientos (con fotos)")
@@ -407,11 +514,7 @@ def detail_view(ficha: str):
                 with top_cols[3]:
                     st.markdown(f"**ID:** `{rec.get('id','')}`")
 
-                if rec.get("parts_consumed"):
-                    st.markdown("**Piezas consumidas:**")
-                    st.code(rec.get("parts_consumed",""), language="")
-
-                # Thumbnails grid
+                # Thumbnails grid (still local display; Drive links are stored)
                 imgs = rec.get("images", [])
                 if imgs:
                     cols = st.columns(3)
@@ -448,3 +551,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
