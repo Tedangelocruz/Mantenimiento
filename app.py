@@ -12,7 +12,7 @@ import streamlit as st
 # ---------------------------
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload  # NEW
 
 # ---------------------------
 # Config
@@ -37,7 +37,6 @@ def _gcreds():
     # Support EITHER a TOML table ([gcp_service_account]) OR a JSON string (GSERVICE_ACCOUNT_JSON)
     info = None
     if "gcp_service_account" in st.secrets:
-        # Works if you stored the JSON as a table
         info = dict(st.secrets["gcp_service_account"])
     else:
         raw = st.secrets.get("GSERVICE_ACCOUNT_JSON", "")
@@ -56,7 +55,7 @@ def _gcreds():
 def _drive():
     return build("drive", "v3", credentials=_gcreds(), cache_discovery=False)
 
-DRIVE_ROOT_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "root")  # put a folder ID in Secrets for a shared folder; otherwise SA's root
+DRIVE_ROOT_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "root")  # shared folder ID or SA's root
 
 def ensure_folder(parent_id: str, name: str) -> str:
     """Find or create a Google Drive folder named `name` under parent_id, return its id."""
@@ -109,6 +108,25 @@ def upsert_file(parent_id: str, filename: str, data: bytes, mimetype: str = None
     else:
         return upload_bytes(parent_id, filename, data, mimetype)
 
+# ---------- NEW: Drive download helpers ----------
+def find_file_in_folder_by_name(parent_id: str, name: str) -> str | None:
+    drv = _drive()
+    q = f"'{parent_id}' in parents and name = '{name}' and trashed = false"
+    res = drv.files().list(q=q, fields="files(id,name,modifiedTime)", pageSize=1).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+def download_file_bytes(file_id: str) -> bytes:
+    drv = _drive()
+    request = drv.files().get_media(fileId=file_id)
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+# ---------- /NEW ----------
+
 # ---------------------------
 # Session-state navigation
 # ---------------------------
@@ -131,8 +149,30 @@ def cache_decorator():
         return st.cache_data(show_spinner=False)
     return st.cache(show_spinner=False)
 
+# ---------- NEW: ensure Excel is present locally ----------
+def ensure_excel_local() -> str:
+    """Make sure EXCEL_PATH exists by pulling latest from Drive if needed."""
+    if os.path.exists(EXCEL_PATH):
+        return EXCEL_PATH
+    excel_name = os.path.basename(EXCEL_PATH)
+    fid = find_file_in_folder_by_name(DRIVE_ROOT_FOLDER_ID, excel_name)
+    if not fid:
+        return EXCEL_PATH  # nothing remote yet
+    try:
+        data = download_file_bytes(fid)
+        os.makedirs(os.path.dirname(EXCEL_PATH), exist_ok=True)
+        with open(EXCEL_PATH, "wb") as f:
+            f.write(data)
+        st.toast("📥 Excel recuperado desde Google Drive.", icon="⬇️")
+    except Exception as e:
+        st.warning(f"No se pudo descargar Excel desde Drive: {e}")
+    return EXCEL_PATH
+# ---------- /NEW ----------
+
 @cache_decorator()
 def load_data(excel_path: str) -> pd.DataFrame:
+    # NEW: sync down from Drive if local is missing
+    excel_path = ensure_excel_local()
     df = pd.read_excel(excel_path, sheet_name=0)
     df.columns = [str(c).strip() for c in df.columns]
     required = ["Ficha", "Modelo", "Location", "Fecha Ultiimo Mantenimiento"]
@@ -167,14 +207,12 @@ def compute_status(df: pd.DataFrame, threshold_days: int) -> pd.DataFrame:
     return out
 
 def style_status(df: pd.DataFrame):
-    # Color Estado + Próximo Mantenimiento (due soon highlighting)
     try:
         styler = df.style.applymap(
             lambda v: ("background-color: #2e7d32; color: white" if v == "Verde"
                        else ("background-color: #c62828; color: white" if v == "Rojo" else "")),
             subset=["Estado"]
         )
-        # Color Proximo Mantenimiento
         today = pd.to_datetime(date.today())
         soon_cutoff = today + pd.Timedelta(days=15)
         def fmt_next(val):
@@ -183,11 +221,11 @@ def style_status(df: pd.DataFrame):
                     return ""
                 d = pd.to_datetime(val)
                 if d < today:
-                    return "background-color: #ffcccc"  # red
+                    return "background-color: #ffcccc"
                 elif d <= soon_cutoff:
-                    return "background-color: #fff4cc"  # yellow
+                    return "background-color: #fff4cc"
                 else:
-                    return "background-color: #ccffcc"  # green
+                    return "background-color: #ccffcc"
             except Exception:
                 return ""
         if "Proximo Mantenimiento" in df.columns:
@@ -207,25 +245,50 @@ def ficha_dir(ficha: str) -> str:
 def metadata_path(ficha: str) -> str:
     return os.path.join(ficha_dir(ficha), "metadata.json")
 
+# ---------- NEW: metadata persistence (Drive <-> local) ----------
+def upload_metadata_to_drive(ficha: str):
+    """After saving metadata.json locally, upsert it to ficha folder in Drive."""
+    folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
+    md_path = metadata_path(ficha)
+    if not os.path.exists(md_path):
+        return
+    with open(md_path, "rb") as f:
+        data = f.read()
+    upsert_file(folder_id, "metadata.json", data, mimetype="application/json")
+
 def load_metadata(ficha: str) -> dict:
     md_path = metadata_path(ficha)
+    # If local exists, use it
     if os.path.exists(md_path):
         try:
             with open(md_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Backward compatibility: ensure modern structure
                 if "records" not in data:
                     data = migrate_old_metadata(data)
                 return data
         except Exception:
-            return {"records": []}
+            pass  # fall back to Drive
+
+    # Try to fetch from Drive if missing or unreadable
+    try:
+        folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
+        fid = find_file_in_folder_by_name(folder_id, "metadata.json")
+        if fid:
+            data_bytes = download_file_bytes(fid)
+            os.makedirs(os.path.dirname(md_path), exist_ok=True)
+            with open(md_path, "wb") as f:
+                f.write(data_bytes)  # cache to local for the session
+            data = json.loads(data_bytes.decode("utf-8"))
+            if "records" not in data:
+                data = migrate_old_metadata(data)
+            return data
+    except Exception as e:
+        st.info(f"No se pudo recuperar metadata desde Drive: {e}")
+
     return {"records": []}
+# ---------- /NEW ----------
 
 def migrate_old_metadata(old: dict) -> dict:
-    """
-    Convert legacy metadata with single fields + images into records[].
-    Legacy keys: fecha_ultima, notas, maintenance_type, parts_consumed, images{}
-    """
     if not isinstance(old, dict):
         return {"records": []}
     rec = {
@@ -247,7 +310,6 @@ def save_metadata(ficha: str, meta: dict) -> None:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def list_images_unassigned(ficha: str):
-    """Images lying in the folder not linked to any record (for cleanup)."""
     d = ficha_dir(ficha)
     files = set([fn for fn in os.listdir(d) if fn.lower().endswith((".png",".jpg",".jpeg",".webp"))])
     linked = set()
@@ -261,7 +323,6 @@ def list_images_unassigned(ficha: str):
 # Excel update helpers
 # ---------------------------
 def backup_excel() -> str:
-    """Create a timestamped backup of the Excel before writing."""
     if not os.path.exists(EXCEL_PATH):
         return ""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -275,16 +336,10 @@ def backup_excel() -> str:
         return ""
 
 def _upload_excel_to_drive(df: pd.DataFrame):
-    """
-    Upload/update the Excel file in Drive even if local write fails.
-    """
-    # write dataframe to in-memory xlsx
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
     data = buf.getvalue()
-
-    # upsert main Excel in Drive root folder (or provided folder)
     excel_name = os.path.basename(EXCEL_PATH)
     link = upsert_file(DRIVE_ROOT_FOLDER_ID, excel_name, data,
                        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -292,11 +347,9 @@ def _upload_excel_to_drive(df: pd.DataFrame):
     return link
 
 def update_excel_date(ficha: str, new_date: date) -> bool:
-    """
-    Update 'Fecha Ultiimo Mantenimiento' for the given ficha in the Excel file,
-    then also upload/update the Excel in Google Drive.
-    """
     try:
+        # NEW: make sure we have the latest locally before modifying
+        ensure_excel_local()
         df = pd.read_excel(EXCEL_PATH, sheet_name=0)
     except Exception as e:
         st.error(f"No se pudo abrir el Excel local: {e}")
@@ -307,18 +360,15 @@ def update_excel_date(ficha: str, new_date: date) -> bool:
         st.error("El Excel no tiene las columnas requeridas ('Ficha', 'Fecha Ultiimo Mantenimiento').")
         return False
 
-    # Normalizar Ficha para comparar
     df["Ficha"] = df["Ficha"].astype(str).str.strip()
     mask = df["Ficha"] == str(ficha).strip()
     if not mask.any():
         st.warning("Ficha no encontrada en el Excel; no se actualizó la fecha.")
         return False
 
-    # Formato día/mes/año (coincide con la lectura dayfirst)
     new_str = new_date.strftime("%d/%m/%Y")
     df.loc[mask, "Fecha Ultiimo Mantenimiento"] = new_str
 
-    # Backup del Excel actual y guardado local
     backup_excel()
     wrote_local = False
     try:
@@ -328,7 +378,6 @@ def update_excel_date(ficha: str, new_date: date) -> bool:
     except Exception as e:
         st.warning(f"No se pudo guardar el Excel localmente: {e}. Igual se subirá a Drive.")
 
-    # Siempre subimos/actualizamos en Drive (aunque el local falle)
     try:
         link = _upload_excel_to_drive(df)
         st.caption(f"📄 Copia en Drive actualizada: {link}")
@@ -414,7 +463,6 @@ def list_view():
     cols = st.columns(4)
     for i, ficha in enumerate(ft["Ficha"]):
         with cols[i % 4]:
-            # (kept as-is to preserve UI/keys)
             if st.button(f"🗂️ {ficha}", key=f"open_{ficha}"):
                 go_detail(str(ficha))
 
@@ -458,7 +506,7 @@ def detail_view(ficha: str):
         rec_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         save_dir = ficha_dir(ficha)
         img_names = []
-        drive_links = []  # NEW
+        drive_links = []
 
         # Create (or find) per-ficha folder in Google Drive
         ficha_folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
@@ -472,7 +520,7 @@ def detail_view(ficha: str):
                 f.write(up.getbuffer())
             img_names.append(fname)
 
-            # Upload to Drive (NEW) and store direct URL
+            # Upload to Drive and store direct URL
             try:
                 drive_link = upload_bytes(ficha_folder_id, fname, up.getbuffer(), mimetype=getattr(up, "type", None))
                 drive_links.append(drive_link)
@@ -486,7 +534,7 @@ def detail_view(ficha: str):
             "notas": notas,
             "parts_consumed": piezas,
             "images": img_names,        # local filenames
-            "drive_links": drive_links, # NEW: Drive URLs for post-reboot display
+            "drive_links": drive_links, # Drive URLs for post-reboot display
             "created_at": datetime.now().isoformat(timespec="seconds")
         }
         meta.setdefault("records", [])
@@ -494,6 +542,12 @@ def detail_view(ficha: str):
         meta["records"] = sorted(meta["records"], key=lambda r: (r.get("fecha") or "", r.get("id","")), reverse=True)
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_metadata(ficha, meta)
+
+        # NEW: keep metadata persisted in Drive
+        try:
+            upload_metadata_to_drive(ficha)
+        except Exception as e:
+            st.info(f"No se pudo subir metadata a Drive: {e}")
 
         # ---- Update Excel and push a copy to Drive ----
         ok = update_excel_date(ficha, fecha_rec)
@@ -533,7 +587,6 @@ def detail_view(ficha: str):
                 imgs = rec.get("images", [])
                 links = rec.get("drive_links", [])
                 cols = st.columns(3)
-                # pair images and links safely
                 max_items = max(len(imgs), len(links))
                 for i in range(max_items):
                     local_name = imgs[i] if i < len(imgs) else None
@@ -559,7 +612,7 @@ def detail_view(ficha: str):
             for i, fn in enumerate(orphans):
                 img_path = os.path.join(ficha_dir(ficha), fn)
                 with cols[i % 3]:
-                    st.image(img_path, use_column_width=True, caption=fn)
+                    st.image(img_path, use_container_width=True, caption=fn)
 
 # ---------------------------
 # Main (single-tab routing)
