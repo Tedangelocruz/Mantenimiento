@@ -4,15 +4,18 @@ import json
 import shutil
 from io import BytesIO
 from datetime import datetime, date, timedelta
+import mimetypes
+
 import pandas as pd
 import streamlit as st
 
-# ---------------------------
-# Google Drive
-# ---------------------------
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload  # NEW
+# Google Cloud imports
+try:
+    from google.oauth2.service_account import Credentials
+    from google.cloud import storage
+except Exception as e:
+    st.warning("google-cloud-storage not installed. Add 'google-cloud-storage>=2.16' to requirements.txt")
+    raise
 
 # ---------------------------
 # Config
@@ -31,101 +34,90 @@ EXCLUDE_FICHAS = {"HONDO VALLE", "VILLA RIVA", "SAJOMA", "PINA", "AIC", "ENRIQUI
 EXCLUDE_FICHAS_UPPER = {s.upper() for s in EXCLUDE_FICHAS}
 
 # ---------------------------
-# Google Drive settings
+# Secrets / GCS helpers
 # ---------------------------
-def _gcreds():
-    # Support EITHER a TOML table ([gcp_service_account]) OR a JSON string (GSERVICE_ACCOUNT_JSON)
-    info = None
-    if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-    else:
-        raw = st.secrets.get("GSERVICE_ACCOUNT_JSON", "")
-        if not raw:
-            st.error('Missing credentials: add either [gcp_service_account] or GSERVICE_ACCOUNT_JSON in Secrets.')
+def _load_gcs_secrets():
+    """
+    Returns (service_account_info_dict, bucket_name)
+    Supports one of two formats in Streamlit Secrets:
+      A) Nested tables:
+         [gcp]
+         bucket = "my-bucket"
+         [gcp.gcp_service_account]
+         type = "service_account"
+         ...
+      B) Flat keys:
+         GCS_BUCKET = "my-bucket"
+         GSERVICE_ACCOUNT_JSON = "{...json...}"
+    """
+    # A) Recommended nested format
+    if "gcp" in st.secrets and "gcp_service_account" in st.secrets["gcp"]:
+        sa_info = st.secrets["gcp"]["gcp_service_account"]
+        bucket = st.secrets["gcp"].get("bucket")
+        if not bucket:
+            st.error("Missing [gcp].bucket in Secrets.")
             st.stop()
+        return sa_info, bucket
+
+    # B) Flat format (JSON string)
+    if "GSERVICE_ACCOUNT_JSON" in st.secrets and "GCS_BUCKET" in st.secrets:
         try:
-            info = json.loads(raw)
+            sa_info = json.loads(st.secrets["GSERVICE_ACCOUNT_JSON"])
         except Exception:
-            st.error("GSERVICE_ACCOUNT_JSON is not valid JSON (check quotes and \\n in private_key).")
+            st.error("GSERVICE_ACCOUNT_JSON is not valid JSON.")
             st.stop()
+        bucket = st.secrets["GCS_BUCKET"]
+        return sa_info, bucket
 
-    scopes = ["https://www.googleapis.com/auth/drive"]
-    return Credentials.from_service_account_info(info, scopes=scopes)
+    st.error("Missing credentials: add either [gcp] + [gcp.gcp_service_account] with 'bucket', or GSERVICE_ACCOUNT_JSON + GCS_BUCKET in Secrets.")
+    st.stop()
 
-def _drive():
-    return build("drive", "v3", credentials=_gcreds(), cache_discovery=False)
 
-DRIVE_ROOT_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "root")  # shared folder ID or SA's root
+@st.cache_resource(show_spinner=False)
+def _gcs_client_and_bucket():
+    sa_info, bucket_name = _load_gcs_secrets()
+    creds = Credentials.from_service_account_info(sa_info)
+    client = storage.Client(credentials=creds, project=sa_info.get("project_id"))
+    bucket = client.bucket(bucket_name)
+    return client, bucket
 
-def ensure_folder(parent_id: str, name: str) -> str:
-    """Find or create a Google Drive folder named `name` under parent_id, return its id."""
-    drv = _drive()
-    q = f"'{parent_id}' in parents and name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    res = drv.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    folder = drv.files().create(body=meta, fields="id").execute()
-    return folder["id"]
 
-def make_public(file_id: str):
-    """Set file 'anyone with the link can view' (ignore errors if already public)."""
-    drv = _drive()
-    try:
-        drv.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
-    except Exception:
-        pass
+def gcs_upload_bytes(path_key: str, data: bytes, content_type: str | None = None) -> str:
+    """Upload bytes to GCS at path_key. Returns GCS blob path_key."""
+    _, bucket = _gcs_client_and_bucket()
+    blob = bucket.blob(path_key)
+    if not content_type:
+        content_type = mimetypes.guess_type(path_key)[0] or "application/octet-stream"
+    blob.upload_from_string(data, content_type=content_type)
+    return path_key
 
-def _direct_image_url(file_id: str) -> str:
-    """Return a direct display URL usable by st.image()."""
-    return f"https://drive.google.com/uc?id={file_id}"
 
-def upload_bytes(parent_id: str, filename: str, data: bytes, mimetype: str = None) -> str:
-    """Upload raw bytes to Drive and return a DIRECT image URL (so Streamlit can render it)."""
-    drv = _drive()
-    media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=False)
-    meta = {"name": filename, "parents": [parent_id]}
-    file = drv.files().create(body=meta, media_body=media, fields="id").execute()
-    file_id = file["id"]
-    make_public(file_id)
-    return _direct_image_url(file_id)
+def gcs_signed_url(path_key: str, minutes: int = 60) -> str:
+    """Create a short-lived signed URL to view the blob (no public ACL needed)."""
+    client, bucket = _gcs_client_and_bucket()
+    blob = bucket.blob(path_key)
+    return blob.generate_signed_url(expiration=timedelta(minutes=minutes), method="GET")
 
-def upsert_file(parent_id: str, filename: str, data: bytes, mimetype: str = None) -> str:
-    """
-    Create or update a file by name under parent_id; return a direct-view link.
-    If a file with the same name exists, it is updated in place (so the link stays stable).
-    """
-    drv = _drive()
-    q = f"'{parent_id}' in parents and name = '{filename}' and trashed = false"
-    res = drv.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
-    media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=False)
-    if res.get("files"):
-        fid = res["files"][0]["id"]
-        drv.files().update(fileId=fid, media_body=media, fields="id").execute()
-        make_public(fid)
-        return _direct_image_url(fid)
-    else:
-        return upload_bytes(parent_id, filename, data, mimetype)
 
-# ---------- NEW: Drive download helpers ----------
-def find_file_in_folder_by_name(parent_id: str, name: str) -> str | None:
-    drv = _drive()
-    q = f"'{parent_id}' in parents and name = '{name}' and trashed = false"
-    res = drv.files().list(q=q, fields="files(id,name,modifiedTime)", pageSize=1).execute()
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
+def gcs_read_text(path_key: str) -> str | None:
+    _, bucket = _gcs_client_and_bucket()
+    blob = bucket.blob(path_key)
+    if not blob.exists():
+        return None
+    return blob.download_as_text(encoding="utf-8")
 
-def download_file_bytes(file_id: str) -> bytes:
-    drv = _drive()
-    request = drv.files().get_media(fileId=file_id)
-    buf = BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
-# ---------- /NEW ----------
+
+def gcs_write_text(path_key: str, text: str) -> None:
+    _, bucket = _gcs_client_and_bucket()
+    blob = bucket.blob(path_key)
+    blob.upload_from_string(text, content_type="application/json; charset=utf-8")
+
+
+def gcs_list(prefix: str) -> list[str]:
+    """List object names under a prefix."""
+    client, bucket = _gcs_client_and_bucket()
+    return [b.name for b in client.list_blobs(bucket, prefix=prefix)]
+
 
 # ---------------------------
 # Session-state navigation
@@ -133,13 +125,16 @@ def download_file_bytes(file_id: str) -> bytes:
 if "selected_ficha" not in st.session_state:
     st.session_state.selected_ficha = None  # None -> list view; string -> detail view
 
+
 def go_list():
     st.session_state.selected_ficha = None
     st.rerun()
 
+
 def go_detail(ficha: str):
     st.session_state.selected_ficha = ficha
     st.rerun()
+
 
 # ---------------------------
 # Helpers
@@ -149,30 +144,9 @@ def cache_decorator():
         return st.cache_data(show_spinner=False)
     return st.cache(show_spinner=False)
 
-# ---------- NEW: ensure Excel is present locally ----------
-def ensure_excel_local() -> str:
-    """Make sure EXCEL_PATH exists by pulling latest from Drive if needed."""
-    if os.path.exists(EXCEL_PATH):
-        return EXCEL_PATH
-    excel_name = os.path.basename(EXCEL_PATH)
-    fid = find_file_in_folder_by_name(DRIVE_ROOT_FOLDER_ID, excel_name)
-    if not fid:
-        return EXCEL_PATH  # nothing remote yet
-    try:
-        data = download_file_bytes(fid)
-        os.makedirs(os.path.dirname(EXCEL_PATH), exist_ok=True)
-        with open(EXCEL_PATH, "wb") as f:
-            f.write(data)
-        st.toast("📥 Excel recuperado desde Google Drive.", icon="⬇️")
-    except Exception as e:
-        st.warning(f"No se pudo descargar Excel desde Drive: {e}")
-    return EXCEL_PATH
-# ---------- /NEW ----------
 
 @cache_decorator()
 def load_data(excel_path: str) -> pd.DataFrame:
-    # NEW: sync down from Drive if local is missing
-    excel_path = ensure_excel_local()
     df = pd.read_excel(excel_path, sheet_name=0)
     df.columns = [str(c).strip() for c in df.columns]
     required = ["Ficha", "Modelo", "Location", "Fecha Ultiimo Mantenimiento"]
@@ -192,10 +166,12 @@ def load_data(excel_path: str) -> pd.DataFrame:
     df["Proximo_Mantenimiento"] = df["Fecha_parsed"] + pd.DateOffset(months=1, days=15)
     return df
 
+
 def compute_status(df: pd.DataFrame, threshold_days: int) -> pd.DataFrame:
     today = date.today()
     out = df.copy()
     out["Días desde último mant."] = (today - out["Fecha_parsed"].dt.date).apply(lambda x: x.days if pd.notnull(x) else None)
+
     def status(d):
         if d is None:
             return "Rojo"
@@ -203,92 +179,77 @@ def compute_status(df: pd.DataFrame, threshold_days: int) -> pd.DataFrame:
             return "Verde" if int(d) < threshold_days else "Rojo"
         except Exception:
             return "Rojo"
+
     out["Estado"] = out["Días desde último mant."].apply(status)
     return out
 
+
 def style_status(df: pd.DataFrame):
+    # Color Estado + Próximo Mantenimiento (due soon highlighting)
     try:
         styler = df.style.applymap(
             lambda v: ("background-color: #2e7d32; color: white" if v == "Verde"
                        else ("background-color: #c62828; color: white" if v == "Rojo" else "")),
             subset=["Estado"]
         )
+        # Color Proximo Mantenimiento
         today = pd.to_datetime(date.today())
         soon_cutoff = today + pd.Timedelta(days=15)
+
         def fmt_next(val):
             try:
                 if pd.isna(val):
                     return ""
                 d = pd.to_datetime(val)
                 if d < today:
-                    return "background-color: #ffcccc"
+                    return "background-color: #ffcccc"  # red
                 elif d <= soon_cutoff:
-                    return "background-color: #fff4cc"
+                    return "background-color: #fff4cc"  # yellow
                 else:
-                    return "background-color: #ccffcc"
+                    return "background-color: #ccffcc"  # green
             except Exception:
                 return ""
+
         if "Proximo Mantenimiento" in df.columns:
             styler = styler.applymap(fmt_next, subset=["Proximo Mantenimiento"])
         return styler
     except Exception:
         return df
 
+
 def safe_key(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-]", "_", str(name))
 
-def ficha_dir(ficha: str) -> str:
-    d = os.path.join(DATA_DIR, safe_key(ficha))
-    os.makedirs(d, exist_ok=True)
-    return d
+
+# ---------------------------
+# Cloud storage paths for per-ficha data
+# ---------------------------
+def _ficha_prefix(ficha: str) -> str:
+    return f"ficha-images/{safe_key(ficha)}/"
+
 
 def metadata_path(ficha: str) -> str:
-    return os.path.join(ficha_dir(ficha), "metadata.json")
+    return _ficha_prefix(ficha) + "metadata.json"
 
-# ---------- NEW: metadata persistence (Drive <-> local) ----------
-def upload_metadata_to_drive(ficha: str):
-    """After saving metadata.json locally, upsert it to ficha folder in Drive."""
-    folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
-    md_path = metadata_path(ficha)
-    if not os.path.exists(md_path):
-        return
-    with open(md_path, "rb") as f:
-        data = f.read()
-    upsert_file(folder_id, "metadata.json", data, mimetype="application/json")
 
 def load_metadata(ficha: str) -> dict:
-    md_path = metadata_path(ficha)
-    # If local exists, use it
-    if os.path.exists(md_path):
-        try:
-            with open(md_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "records" not in data:
-                    data = migrate_old_metadata(data)
-                return data
-        except Exception:
-            pass  # fall back to Drive
-
-    # Try to fetch from Drive if missing or unreadable
+    txt = gcs_read_text(metadata_path(ficha))
+    if not txt:
+        return {"records": []}
     try:
-        folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
-        fid = find_file_in_folder_by_name(folder_id, "metadata.json")
-        if fid:
-            data_bytes = download_file_bytes(fid)
-            os.makedirs(os.path.dirname(md_path), exist_ok=True)
-            with open(md_path, "wb") as f:
-                f.write(data_bytes)  # cache to local for the session
-            data = json.loads(data_bytes.decode("utf-8"))
-            if "records" not in data:
-                data = migrate_old_metadata(data)
-            return data
-    except Exception as e:
-        st.info(f"No se pudo recuperar metadata desde Drive: {e}")
+        data = json.loads(txt)
+        if "records" not in data:
+            data = migrate_old_metadata(data)
+        return data
+    except Exception:
+        return {"records": []}
 
-    return {"records": []}
-# ---------- /NEW ----------
 
 def migrate_old_metadata(old: dict) -> dict:
+    """
+    Convert legacy metadata with single fields + images into records[].
+    Legacy keys: fecha_ultima, notas, maintenance_type, parts_consumed, images{}
+    """
     if not isinstance(old, dict):
         return {"records": []}
     rec = {
@@ -304,25 +265,29 @@ def migrate_old_metadata(old: dict) -> dict:
         rec["images"] = []
     return {"records": [rec] if (rec["fecha"] or rec["notas"] or rec["images"]) else []}
 
+
 def save_metadata(ficha: str, meta: dict) -> None:
-    md_path = metadata_path(ficha)
-    with open(md_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    gcs_write_text(metadata_path(ficha), json.dumps(meta, ensure_ascii=False, indent=2))
+
 
 def list_images_unassigned(ficha: str):
-    d = ficha_dir(ficha)
-    files = set([fn for fn in os.listdir(d) if fn.lower().endswith((".png",".jpg",".jpeg",".webp"))])
+    """Images lying in the GCS prefix not linked to any record (for cleanup)."""
+    prefix = _ficha_prefix(ficha)
+    names = gcs_list(prefix)
+    img_files = {name.split("/")[-1] for name in names if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))}
     linked = set()
     meta = load_metadata(ficha)
     for r in meta.get("records", []):
         for fn in r.get("images", []):
             linked.add(fn)
-    return sorted(list(files - linked))
+    return sorted(list(img_files - linked))
+
 
 # ---------------------------
 # Excel update helpers
 # ---------------------------
 def backup_excel() -> str:
+    """Create a timestamped local backup of the Excel before writing, and push to GCS."""
     if not os.path.exists(EXCEL_PATH):
         return ""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -331,28 +296,25 @@ def backup_excel() -> str:
     dst = os.path.join(BACKUP_DIR, f"{name}_backup_{ts}{ext}")
     try:
         shutil.copy2(EXCEL_PATH, dst)
+        # Also copy to GCS for durability
+        with open(dst, "rb") as f:
+            gcs_upload_bytes(f"excel-backups/{os.path.basename(dst)}", f.read(),
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         return dst
     except Exception:
         return ""
 
-def _upload_excel_to_drive(df: pd.DataFrame):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
-    data = buf.getvalue()
-    excel_name = os.path.basename(EXCEL_PATH)
-    link = upsert_file(DRIVE_ROOT_FOLDER_ID, excel_name, data,
-                       mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.toast("Excel subido/actualizado en Google Drive.", icon="☁️")
-    return link
 
 def update_excel_date(ficha: str, new_date: date) -> bool:
+    """
+    Update 'Fecha Ultiimo Mantenimiento' for the given ficha in the Excel file.
+    Returns True if a row was updated and the file saved.
+    NOTE: On Streamlit Cloud, local files are ephemeral; consider migrating to Google Sheets.
+    """
     try:
-        # NEW: make sure we have the latest locally before modifying
-        ensure_excel_local()
         df = pd.read_excel(EXCEL_PATH, sheet_name=0)
     except Exception as e:
-        st.error(f"No se pudo abrir el Excel local: {e}")
+        st.error(f"No se pudo abrir el Excel: {e}")
         return False
 
     df.columns = [str(c).strip() for c in df.columns]
@@ -360,31 +322,28 @@ def update_excel_date(ficha: str, new_date: date) -> bool:
         st.error("El Excel no tiene las columnas requeridas ('Ficha', 'Fecha Ultiimo Mantenimiento').")
         return False
 
+    # Normalizar Ficha para comparar
     df["Ficha"] = df["Ficha"].astype(str).str.strip()
     mask = df["Ficha"] == str(ficha).strip()
+
     if not mask.any():
         st.warning("Ficha no encontrada en el Excel; no se actualizó la fecha.")
         return False
 
+    # Formato día/mes/año (coincide con la lectura dayfirst)
     new_str = new_date.strftime("%d/%m/%Y")
     df.loc[mask, "Fecha Ultiimo Mantenimiento"] = new_str
 
+    # Backup y guardado
     backup_excel()
-    wrote_local = False
     try:
         with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
             df.to_excel(writer, index=False)
-        wrote_local = True
+        return True
     except Exception as e:
-        st.warning(f"No se pudo guardar el Excel localmente: {e}. Igual se subirá a Drive.")
+        st.error(f"Error al guardar el Excel: {e}")
+        return False
 
-    try:
-        link = _upload_excel_to_drive(df)
-        st.caption(f"📄 Copia en Drive actualizada: {link}")
-    except Exception as e:
-        st.error(f"No se pudo subir el Excel a Drive: {e}")
-
-    return True if wrote_local else False
 
 # ---------------------------
 # Views
@@ -466,6 +425,7 @@ def list_view():
             if st.button(f"🗂️ {ficha}", key=f"open_{ficha}"):
                 go_detail(str(ficha))
 
+
 def detail_view(ficha: str):
     st.button("⬅️ Volver a la lista", on_click=go_list)
     st.header(f"Ficha: {ficha}")
@@ -493,39 +453,24 @@ def detail_view(ficha: str):
         colA, colB = st.columns(2)
         with colA:
             fecha_rec = st.date_input("Fecha del mantenimiento", value=date.today(), key="rec_fecha")
-            tipo = st.selectbox("Tipo de mantenimiento", options=["MP1","MP2","MP3","MP4"], index=0, key="rec_tipo")
+            tipo = st.selectbox("Tipo de mantenimiento", options=["MP1", "MP2", "MP3", "MP4"], index=0, key="rec_tipo")
         with colB:
             notas = st.text_area("Notas / Detalles", value="", height=120, placeholder="Trabajo realizado, observaciones...", key="rec_notas")
             piezas = st.text_area("Piezas consumidas", value="", height=120, placeholder="Lista de piezas/consumibles (uno por línea o separado por comas).", key="rec_piezas")
 
         st.markdown("**Evidencia fotográfica para este mantenimiento**")
-        up_files = st.file_uploader("Agregar imágenes", type=["png","jpg","jpeg","webp"], accept_multiple_files=True, key="rec_uploader")
+        up_files = st.file_uploader("Agregar imágenes", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key="rec_uploader")
 
         saved = st.form_submit_button("💾 Guardar mantenimiento")
     if saved:
         rec_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        save_dir = ficha_dir(ficha)
         img_names = []
-        drive_links = []
-
-        # Create (or find) per-ficha folder in Google Drive
-        ficha_folder_id = ensure_folder(DRIVE_ROOT_FOLDER_ID, safe_key(ficha))
-
         for up in up_files or []:
             ext = os.path.splitext(up.name)[1].lower()
             fname = f"{rec_id}_{safe_key(os.path.splitext(up.name)[0])}{ext}"
-            path = os.path.join(save_dir, fname)
-            # Save locally (as before)
-            with open(path, "wb") as f:
-                f.write(up.getbuffer())
+            gcs_key = _ficha_prefix(ficha) + fname
+            gcs_upload_bytes(gcs_key, up.getvalue(), content_type=up.type or None)
             img_names.append(fname)
-
-            # Upload to Drive and store direct URL
-            try:
-                drive_link = upload_bytes(ficha_folder_id, fname, up.getbuffer(), mimetype=getattr(up, "type", None))
-                drive_links.append(drive_link)
-            except Exception as e:
-                st.warning(f"No se pudo subir {fname} a Drive: {e}")
 
         new_rec = {
             "id": rec_id,
@@ -533,33 +478,27 @@ def detail_view(ficha: str):
             "maintenance_type": tipo,
             "notas": notas,
             "parts_consumed": piezas,
-            "images": img_names,        # local filenames
-            "drive_links": drive_links, # Drive URLs for post-reboot display
+            "images": img_names,
             "created_at": datetime.now().isoformat(timespec="seconds")
         }
         meta.setdefault("records", [])
         meta["records"].append(new_rec)
-        meta["records"] = sorted(meta["records"], key=lambda r: (r.get("fecha") or "", r.get("id","")), reverse=True)
+        meta["records"] = sorted(meta["records"], key=lambda r: (r.get("fecha") or "", r.get("id", "")), reverse=True)
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_metadata(ficha, meta)
 
-        # NEW: keep metadata persisted in Drive
-        try:
-            upload_metadata_to_drive(ficha)
-        except Exception as e:
-            st.info(f"No se pudo subir metadata a Drive: {e}")
-
-        # ---- Update Excel and push a copy to Drive ----
+        # ---- update Excel with the new maintenance date ----
         ok = update_excel_date(ficha, fecha_rec)
         if ok:
+            # Clear cache so the main list reloads fresh
             try:
                 load_data.clear()
             except Exception:
                 pass
-            st.success("Mantenimiento guardado, Excel actualizado y copiado a Google Drive. Regresando a la lista...")
+            st.success("Mantenimiento guardado y Excel actualizado. Regresando a la lista principal...")
             go_list()
         else:
-            st.warning("Se guardó el registro y se subieron las imágenes; no se pudo actualizar el Excel local, pero sí se copió a Drive.")
+            st.warning("Se guardó el mantenimiento pero no se pudo actualizar el Excel. (En Cloud el Excel local es temporal).")
 
     st.divider()
     st.subheader("📚 Historial de mantenimientos (con fotos)")
@@ -571,59 +510,74 @@ def detail_view(ficha: str):
     else:
         for idx, rec in enumerate(records):
             with st.container(border=True):
-                top_cols = st.columns([2,1,1,1])
+                top_cols = st.columns([2, 1, 1, 1])
                 with top_cols[0]:
-                    st.markdown(f"**Fecha:** {rec.get('fecha','—')}")
-                    st.markdown(f"**Notas:** {rec.get('notas','')}")
+                    st.markdown(f"**Fecha:** {rec.get('fecha', '—')}")
+                    st.markdown(f"**Notas:** {rec.get('notas', '')}")
                 with top_cols[1]:
-                    st.markdown(f"**Tipo:** {rec.get('maintenance_type','—')}")
+                    st.markdown(f"**Tipo:** {rec.get('maintenance_type', '—')}")
                 with top_cols[2]:
-                    img_count = len(rec.get('images',[]))
+                    img_count = len(rec.get('images', []))
                     st.markdown(f"**Imágenes:** {img_count}")
                 with top_cols[3]:
-                    st.markdown(f"**ID:** `{rec.get('id','')}`")
+                    st.markdown(f"**ID:** `{rec.get('id', '')}`")
 
-                # Thumbnails grid: try local first, fall back to Drive URLs
+                if rec.get("parts_consumed"):
+                    st.markdown("**Piezas consumidas:**")
+                    st.code(rec.get("parts_consumed", ""), language="")
+
+                # Thumbnails grid from GCS (signed URLs)
                 imgs = rec.get("images", [])
-                links = rec.get("drive_links", [])
-                cols = st.columns(3)
-                max_items = max(len(imgs), len(links))
-                for i in range(max_items):
-                    local_name = imgs[i] if i < len(imgs) else None
-                    drive_url = links[i] if i < len(links) else None
-                    with cols[i % 3]:
-                        shown = False
-                        if local_name:
-                            img_path = os.path.join(ficha_dir(ficha), local_name)
-                            if os.path.exists(img_path):
-                                st.image(img_path, use_container_width=True, caption=local_name)
-                                shown = True
-                        if not shown and drive_url:
-                            st.image(drive_url, use_container_width=True, caption=os.path.basename(drive_url))
-                        if not shown and local_name:
-                            st.warning(f"Archivo faltante: {local_name}")
+                if imgs:
+                    cols = st.columns(3)
+                    for i, fn in enumerate(imgs):
+                        gcs_key = _ficha_prefix(ficha) + fn
+                        try:
+                            url = gcs_signed_url(gcs_key, minutes=30)
+                            with cols[i % 3]:
+                                st.image(url, use_column_width=True, caption=fn)
+                        except Exception as e:
+                            with cols[i % 3]:
+                                st.warning(f"No se pudo mostrar {fn}: {e}")
 
     # Optional: show orphan images not linked to any record
     orphans = list_images_unassigned(ficha)
     if orphans:
         with st.expander("🧹 Imágenes sueltas (no asociadas a ningún registro)"):
-            st.caption("Estas imágenes están en la carpeta pero no pertenecen a ningún mantenimiento guardado.")
+            st.caption("Estas imágenes están en la nube pero no pertenecen a ningún mantenimiento guardado.")
             cols = st.columns(3)
             for i, fn in enumerate(orphans):
-                img_path = os.path.join(ficha_dir(ficha), fn)
+                gcs_key = _ficha_prefix(ficha) + fn
+                url = gcs_signed_url(gcs_key, minutes=30)
                 with cols[i % 3]:
-                    st.image(img_path, use_container_width=True, caption=fn)
+                    st.image(url, use_column_width=True, caption=fn)
+
 
 # ---------------------------
 # Main (single-tab routing)
 # ---------------------------
 def main():
-    st.title("📋 Seguimiento de Mantenimientos por Ficha — una sola pestaña")
+    st.title("📋 Seguimiento de Mantenimientos por Ficha — una sola pestaña (con GCS)")
+
+    # Quick secrets sanity check (hidden behind an expander)
+    with st.expander("⚙️ Diagnóstico de credenciales (ocultar en producción)"):
+        if st.button("Probar acceso a GCS"):
+            try:
+                client, bucket = _gcs_client_and_bucket()
+                test_blob = f"healthchecks/{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                gcs_upload_bytes(test_blob, b"ok", "text/plain")
+                url = gcs_signed_url(test_blob, minutes=1)
+                st.success(f"Subida OK a gs://{bucket.name}/{test_blob}")
+                st.write("Signed URL (temporal):", url)
+            except Exception as e:
+                st.error(f"Error probando GCS: {e}")
 
     if st.session_state.selected_ficha is None:
         list_view()
     else:
         detail_view(st.session_state.selected_ficha)
 
+
 if __name__ == "__main__":
     main()
+
