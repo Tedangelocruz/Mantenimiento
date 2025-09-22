@@ -5,3 +5,5 @@ gspread>=6.0
 gspread-dataframe>=3.4
 google-auth>=2.22
 google-api-python-client>=2.120
+Pillow>=10.2
+protobuf<6
