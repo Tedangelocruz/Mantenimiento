@@ -690,12 +690,12 @@ def detail_view(ficha: str):
                     if st.button("✏️ Editar", key=f"btn_edit_{rec['id']}"):
                         st.session_state.editing_rec_id = rec["id"]
                         st.session_state.deleting_rec_id = None
-                        st.experimental_rerun()
+                        st.rerun()
                 with bcols[1]:
                     if st.button("🗑️ Eliminar", key=f"btn_del_{rec['id']}"):
                         st.session_state.deleting_rec_id = rec["id"]
                         st.session_state.editing_rec_id = None
-                        st.experimental_rerun()
+                        st.rerun()
 
                 # Thumbnails grid from GCS (signed URLs)
                 imgs = rec.get("images", [])
@@ -761,4 +761,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
