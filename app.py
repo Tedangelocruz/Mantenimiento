@@ -535,7 +535,7 @@ def detail_view(ficha: str):
                         try:
                             url = gcs_signed_url(gcs_key, minutes=30)
                             with cols[i % 3]:
-                                st.image(url, use_column_width=True, caption=fn)
+                                st.image(url, use_container_width=True, caption=fn)
                         except Exception as e:
                             with cols[i % 3]:
                                 st.warning(f"No se pudo mostrar {fn}: {e}")
@@ -550,7 +550,7 @@ def detail_view(ficha: str):
                 gcs_key = _ficha_prefix(ficha) + fn
                 url = gcs_signed_url(gcs_key, minutes=30)
                 with cols[i % 3]:
-                    st.image(url, use_column_width=True, caption=fn)
+                    st.image(url, use_container_width=True, caption=fn)
 
 
 # ---------------------------
