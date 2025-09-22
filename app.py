@@ -13,6 +13,7 @@ import streamlit as st
 try:
     from google.oauth2.service_account import Credentials
     from google.cloud import storage
+    from google.api_core.exceptions import NotFound
 except Exception as e:
     st.warning("google-cloud-storage not installed. Add 'google-cloud-storage>=2.16' to requirements.txt")
     raise
@@ -82,7 +83,7 @@ def _gcs_client_and_bucket():
     return client, bucket
 
 
-def gcs_upload_bytes(path_key: str, data: bytes, content_type: str | None = None) -> str:
+def gcs_upload_bytes(path_key, data, content_type=None):
     """Upload bytes to GCS at path_key. Returns GCS blob path_key."""
     _, bucket = _gcs_client_and_bucket()
     blob = bucket.blob(path_key)
@@ -92,14 +93,14 @@ def gcs_upload_bytes(path_key: str, data: bytes, content_type: str | None = None
     return path_key
 
 
-def gcs_signed_url(path_key: str, minutes: int = 60) -> str:
+def gcs_signed_url(path_key, minutes=60):
     """Create a short-lived signed URL to view the blob (no public ACL needed)."""
     client, bucket = _gcs_client_and_bucket()
     blob = bucket.blob(path_key)
     return blob.generate_signed_url(expiration=timedelta(minutes=minutes), method="GET")
 
 
-def gcs_read_text(path_key: str) -> str | None:
+def gcs_read_text(path_key):
     _, bucket = _gcs_client_and_bucket()
     blob = bucket.blob(path_key)
     if not blob.exists():
@@ -107,32 +108,53 @@ def gcs_read_text(path_key: str) -> str | None:
     return blob.download_as_text(encoding="utf-8")
 
 
-def gcs_write_text(path_key: str, text: str) -> None:
+def gcs_write_text(path_key, text):
     _, bucket = _gcs_client_and_bucket()
     blob = bucket.blob(path_key)
     blob.upload_from_string(text, content_type="application/json; charset=utf-8")
 
 
-def gcs_list(prefix: str) -> list[str]:
+def gcs_list(prefix):
     """List object names under a prefix."""
     client, bucket = _gcs_client_and_bucket()
     return [b.name for b in client.list_blobs(bucket, prefix=prefix)]
 
 
+def gcs_delete(path_key):
+    """Delete a blob if it exists; ignore NotFound."""
+    _, bucket = _gcs_client_and_bucket()
+    blob = bucket.blob(path_key)
+    try:
+        blob.delete()
+    except NotFound:
+        pass
+
+
 # ---------------------------
-# Session-state navigation
+# Session-state navigation & edit/delete state
 # ---------------------------
 if "selected_ficha" not in st.session_state:
     st.session_state.selected_ficha = None  # None -> list view; string -> detail view
 
+# Track which record is being edited / deleted per ficha
+if "editing_rec_id" not in st.session_state:
+    st.session_state.editing_rec_id = None
+
+if "deleting_rec_id" not in st.session_state:
+    st.session_state.deleting_rec_id = None
+
 
 def go_list():
     st.session_state.selected_ficha = None
+    st.session_state.editing_rec_id = None
+    st.session_state.deleting_rec_id = None
     st.rerun()
 
 
 def go_detail(ficha: str):
     st.session_state.selected_ficha = ficha
+    st.session_state.editing_rec_id = None
+    st.session_state.deleting_rec_id = None
     st.rerun()
 
 
@@ -193,15 +215,15 @@ def style_status(df: pd.DataFrame):
             subset=["Estado"]
         )
         # Color Proximo Mantenimiento
-        today = pd.to_datetime(date.today())
-        soon_cutoff = today + pd.Timedelta(days=15)
+        today_dt = pd.to_datetime(date.today())
+        soon_cutoff = today_dt + pd.Timedelta(days=15)
 
         def fmt_next(val):
             try:
                 if pd.isna(val):
                     return ""
                 d = pd.to_datetime(val)
-                if d < today:
+                if d < today_dt:
                     return "background-color: #ffcccc"  # red
                 elif d <= soon_cutoff:
                     return "background-color: #fff4cc"  # yellow
@@ -426,6 +448,138 @@ def list_view():
                 go_detail(str(ficha))
 
 
+def _render_edit_form(ficha: str, rec: dict):
+    st.markdown("### ✏️ Editar mantenimiento")
+    with st.form(key=f"form_edit_{rec['id']}"):
+        # Fecha
+        try:
+            parsed_fecha = pd.to_datetime(rec.get("fecha")).date()
+        except Exception:
+            parsed_fecha = date.today()
+        new_fecha = st.date_input("Fecha del mantenimiento", value=parsed_fecha, key=f"edit_fecha_{rec['id']}")
+        options = ["MP1", "MP2", "MP3", "MP4"]
+        try:
+            idx = options.index(rec.get("maintenance_type", "MP1"))
+        except ValueError:
+            idx = 0
+        new_tipo = st.selectbox("Tipo de mantenimiento", options=options, index=idx, key=f"edit_tipo_{rec['id']}")
+        new_notas = st.text_area("Notas / Detalles", value=rec.get("notas", ""), height=120, key=f"edit_notas_{rec['id']}")
+        new_piezas = st.text_area("Piezas consumidas", value=rec.get("parts_consumed", ""), height=120, key=f"edit_piezas_{rec['id']}")
+
+        st.markdown("**Imágenes actuales (marca para eliminar):**")
+        imgs = rec.get("images", [])
+        del_imgs = st.multiselect("Seleccionar imágenes a eliminar", options=imgs, default=[], key=f"edit_delimgs_{rec['id']}")
+
+        st.markdown("**Agregar imágenes nuevas:**")
+        up_new_files = st.file_uploader("Nuevas imágenes", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True,
+                                        key=f"edit_uploader_{rec['id']}")
+
+        update_excel = st.checkbox("Actualizar Excel con esta fecha editada", value=False, key=f"edit_update_excel_{rec['id']}")
+
+        c1, c2, c3 = st.columns(3)
+        submitted = c1.form_submit_button("💾 Guardar cambios")
+        cancelled = c2.form_submit_button("Cancelar")
+        if submitted:
+            # Apply deletions
+            for fn in del_imgs:
+                gcs_delete(_ficha_prefix(ficha) + fn)
+            # Keep remaining images
+            remaining_imgs = [fn for fn in imgs if fn not in del_imgs]
+
+            # Upload new images
+            for up in up_new_files or []:
+                ext = os.path.splitext(up.name)[1].lower()
+                fname = f"{rec['id']}_{safe_key(os.path.splitext(up.name)[0])}{ext}"
+                gcs_key = _ficha_prefix(ficha) + fname
+                gcs_upload_bytes(gcs_key, up.getvalue(), content_type=up.type or None)
+                remaining_imgs.append(fname)
+
+            # Update record fields
+            rec["fecha"] = new_fecha.isoformat()
+            rec["maintenance_type"] = new_tipo
+            rec["notas"] = new_notas
+            rec["parts_consumed"] = new_piezas
+            rec["images"] = remaining_imgs
+            rec["modified_at"] = datetime.now().isoformat(timespec="seconds")
+
+            # Persist metadata
+            meta = load_metadata(ficha)
+            # Replace this record by id
+            meta["records"] = [rec if r.get("id") == rec["id"] else r for r in meta.get("records", [])]
+            meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            save_metadata(ficha, meta)
+
+            # Optionally update Excel
+            if update_excel:
+                ok = update_excel_date(ficha, new_fecha)
+                if ok:
+                    try:
+                        load_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Cambios guardados y Excel actualizado.")
+                else:
+                    st.warning("Cambios guardados pero no se pudo actualizar el Excel.")
+            else:
+                st.success("Cambios guardados.")
+
+            st.session_state.editing_rec_id = None
+            st.rerun()
+
+        if cancelled:
+            st.session_state.editing_rec_id = None
+            st.info("Edición cancelada.")
+            st.rerun()
+
+
+def _render_delete_form(ficha: str, rec: dict):
+    st.markdown("### 🗑️ Eliminar mantenimiento")
+    st.warning("Esta acción eliminará el mantenimiento y **todas** sus imágenes asociadas.")
+    with st.form(key=f"form_delete_{rec['id']}"):
+        upd_excel = st.checkbox("Después de eliminar, actualizar Excel a la última fecha restante (si existe)", value=False,
+                                key=f"del_update_excel_{rec['id']}")
+        c1, c2 = st.columns(2)
+        do_delete = c1.form_submit_button("❗ Eliminar definitivamente")
+        cancel = c2.form_submit_button("Cancelar")
+        if do_delete:
+            # Delete images
+            for fn in rec.get("images", []) or []:
+                gcs_delete(_ficha_prefix(ficha) + fn)
+            # Remove record
+            meta = load_metadata(ficha)
+            meta["records"] = [r for r in meta.get("records", []) if r.get("id") != rec["id"]]
+            meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            save_metadata(ficha, meta)
+
+            # Optionally update Excel to latest remaining date
+            if upd_excel and meta["records"]:
+                try:
+                    dates = [pd.to_datetime(r.get("fecha")) for r in meta["records"] if r.get("fecha")]
+                    latest = max(dates).date() if dates else None
+                    if latest:
+                        ok = update_excel_date(ficha, latest)
+                        if ok:
+                            try:
+                                load_data.clear()
+                            except Exception:
+                                pass
+                            st.success("Eliminado. Excel actualizado a la última fecha restante.")
+                        else:
+                            st.warning("Eliminado. No se pudo actualizar el Excel.")
+                    else:
+                        st.info("Eliminado. No hay fechas válidas para actualizar el Excel.")
+                except Exception:
+                    st.warning("Eliminado. No se pudo determinar la última fecha para el Excel.")
+            else:
+                st.success("Mantenimiento eliminado.")
+            st.session_state.deleting_rec_id = None
+            st.rerun()
+        if cancel:
+            st.session_state.deleting_rec_id = None
+            st.info("Eliminación cancelada.")
+            st.rerun()
+
+
 def detail_view(ficha: str):
     st.button("⬅️ Volver a la lista", on_click=go_list)
     st.header(f"Ficha: {ficha}")
@@ -509,7 +663,11 @@ def detail_view(ficha: str):
         st.info("Sin registros guardados todavía. Usa el formulario de arriba para crear el primero.")
     else:
         for idx, rec in enumerate(records):
-            with st.container(border=True):
+            try:
+                c = st.container(border=True)
+            except TypeError:
+                c = st.expander("Registro", expanded=True)
+            with c:
                 top_cols = st.columns([2, 1, 1, 1])
                 with top_cols[0]:
                     st.markdown(f"**Fecha:** {rec.get('fecha', '—')}")
@@ -526,6 +684,19 @@ def detail_view(ficha: str):
                     st.markdown("**Piezas consumidas:**")
                     st.code(rec.get("parts_consumed", ""), language="")
 
+                # Buttons: Edit / Delete
+                bcols = st.columns([1, 1, 6])
+                with bcols[0]:
+                    if st.button("✏️ Editar", key=f"btn_edit_{rec['id']}"):
+                        st.session_state.editing_rec_id = rec["id"]
+                        st.session_state.deleting_rec_id = None
+                        st.experimental_rerun()
+                with bcols[1]:
+                    if st.button("🗑️ Eliminar", key=f"btn_del_{rec['id']}"):
+                        st.session_state.deleting_rec_id = rec["id"]
+                        st.session_state.editing_rec_id = None
+                        st.experimental_rerun()
+
                 # Thumbnails grid from GCS (signed URLs)
                 imgs = rec.get("images", [])
                 if imgs:
@@ -535,10 +706,16 @@ def detail_view(ficha: str):
                         try:
                             url = gcs_signed_url(gcs_key, minutes=30)
                             with cols[i % 3]:
-                                st.image(url, use_container_width=True, caption=fn)
+                                st.image(url, use_column_width=True, caption=fn)
                         except Exception as e:
                             with cols[i % 3]:
                                 st.warning(f"No se pudo mostrar {fn}: {e}")
+
+                # Inline editor / delete confirmation
+                if st.session_state.editing_rec_id == rec["id"]:
+                    _render_edit_form(ficha, rec)
+                if st.session_state.deleting_rec_id == rec["id"]:
+                    _render_delete_form(ficha, rec)
 
     # Optional: show orphan images not linked to any record
     orphans = list_images_unassigned(ficha)
@@ -550,14 +727,14 @@ def detail_view(ficha: str):
                 gcs_key = _ficha_prefix(ficha) + fn
                 url = gcs_signed_url(gcs_key, minutes=30)
                 with cols[i % 3]:
-                    st.image(url, use_container_width=True, caption=fn)
+                    st.image(url, use_column_width=True, caption=fn)
 
 
 # ---------------------------
 # Main (single-tab routing)
 # ---------------------------
-def main():
-    st.title("📋 Seguimiento de Mantenimientos por Ficha — una sola pestaña (con GCS)")
+def list_view_entry():
+    st.title("📋 Seguimiento de Mantenimientos por Ficha — una sola pestaña (con GCS + editar/eliminar)")
 
     # Quick secrets sanity check (hidden behind an expander)
     with st.expander("⚙️ Diagnóstico de credenciales (ocultar en producción)"):
@@ -576,6 +753,10 @@ def main():
         list_view()
     else:
         detail_view(st.session_state.selected_ficha)
+
+
+def main():
+    list_view_entry()
 
 
 if __name__ == "__main__":
