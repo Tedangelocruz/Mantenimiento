@@ -734,7 +734,7 @@ def detail_view(ficha: str):
 # Main (single-tab routing)
 # ---------------------------
 def list_view_entry():
-    st.title("📋 Seguimiento de Mantenimientos por Ficha — una sola pestaña (con GCS + editar/eliminar)")
+    st.title("📋 Seguimiento de Mantenimientos por Ficha")
 
     # Quick secrets sanity check (hidden behind an expander)
     with st.expander("⚙️ Diagnóstico de credenciales (ocultar en producción)"):
