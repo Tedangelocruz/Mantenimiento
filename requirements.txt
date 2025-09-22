@@ -7,3 +7,4 @@ google-auth>=2.22
 google-api-python-client>=2.120
 Pillow>=10.2
 protobuf<6
+google-cloud-storage>=2.16
